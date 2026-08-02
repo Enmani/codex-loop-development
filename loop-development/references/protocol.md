@@ -1,105 +1,150 @@
 # Loop Development Protocol
 
-## Truth ownership
+## Contents
+
+1. Truth ownership and plan contract
+2. Durable state and leadership
+3. Immutable report Outbox
+4. Event envelope and stage state machine
+5. Foreman failover transaction
+6. Foreman snapshot and terminal shutdown
+7. Idempotency and ready-frontier rules
+
+## Truth ownership and plan contract
 
 Keep one owner for each kind of truth:
 
-- Repository plan and checklists: required scope, dependency, acceptance, and user-gate truth.
-- Durable run state under the local Codex state directory: current execution truth.
-- Foreman's latest full `LOOP_STATE`: a compact, human-visible mirror of the durable state.
-- Worker messages and coordination cards: evidence and wake signals, never acceptance truth.
+- Repository plan and checklists: required scope, dependencies, acceptance, and user gates.
+- Durable run state: execution state, active leadership epoch, participants, automation IDs, decisions, and expected transition.
+- Immutable report Outbox: worker delivery payloads that must survive message failure.
+- Foreman's latest full `LOOP_STATE`: compact human-visible mirror of durable state.
+- Worker messages and coordination cards: wake signals and evidence pointers, never acceptance truth.
 - Monitor history: reminder cooldown and watchdog observations only.
 
-Do not make task titles, summaries, or the monitor's interpretation authoritative.
+Do not make task titles, summaries, delegation ancestry, or the monitor's interpretation authoritative.
 
-## Plan contract
+Before dispatch, establish a stable `runId`, exact project ID/cwd, source plan paths, unique stage IDs, dependencies, scope, write sets, shared locks, verification, user gates, and maximum parallelism. Normalize ambiguous Markdown plans with the bundled manifest validator.
 
-Before dispatch, establish:
+## Durable state and leadership
 
-- A stable run identifier.
-- One or more source plan paths.
-- Stable, unique stage IDs.
-- Dependencies for every stage.
-- Scope and deliverables.
-- Planned write set and shared contract locks.
-- Independent acceptance criteria and verification commands.
-- User decision gates.
-- A maximum parallelism rule.
+Store one record per run at `${CODEX_HOME}/loop-development/runs/<runId>.json`, falling back to `~/.codex/loop-development/runs/<runId>.json`.
 
-If multiple plans are plausible or a dependency/acceptance boundary cannot be derived safely, ask the user before creating the loop. Do not guess merely from the newest filename.
+Use schema version 2. The minimum leadership shape is:
 
-Use this normalized shape when a plan needs compilation:
+```json
+{
+  "schemaVersion": 2,
+  "runId": "loop-20260802-example",
+  "revision": 7,
+  "status": "running",
+  "foremanThreadId": "thread-current",
+  "leadership": {
+    "epoch": 2,
+    "status": "active",
+    "activeForemanThreadId": "thread-current",
+    "previousForemanThreadIds": ["thread-old"],
+    "repair": null,
+    "lastRepair": null,
+    "takeover": null,
+    "lastTakeover": null
+  },
+  "project": {
+    "projectId": "saved-project-id",
+    "cwd": "C:/repo",
+    "environmentType": "local"
+  },
+  "workerProfile": {
+    "model": "gpt-5.6-luna",
+    "thinking": "max"
+  },
+  "monitorThreadId": "thread-monitor",
+  "automationId": "automation-monitor",
+  "auxiliaryAutomationIds": [],
+  "planFiles": ["C:/repo/docs/plan.md"],
+  "decisionLedger": [],
+  "reportDecisions": {},
+  "accepted": [],
+  "active": {},
+  "returned": {},
+  "blocked": {},
+  "ready": [],
+  "expectedNext": null,
+  "automationShutdown": null
+}
+```
+
+`foremanThreadId` is only a compatibility mirror. Route from `leadership.activeForemanThreadId` and `leadership.epoch`. While `leadership.status=electing`, both active IDs are null and the prior foreman is fenced.
+
+`workerProfile` is part of execution truth and is fixed to `gpt-5.6-luna` with `max` reasoning. Every initial or downstream implementation task must pass both overrides explicitly. The monitor remains `gpt-5.6-luna` with `xhigh`; the foreman profile is not changed unless the user separately specifies it.
+
+Only the active foreman may use the generic execution write:
+
+```text
+node <skill-dir>/scripts/state-store.mjs write <runId> <expectedRevision> <actorForemanThreadId> <actorForemanEpoch> '<full-state-json>'
+```
+
+The tool rejects stale foreman ID/epoch pairs and rejects leadership edits through generic writes. It automatically reads legacy schema-1 records as epoch-1 active records; the next valid schema-2 write persists the migration.
+
+## Immutable report Outbox
+
+Before cross-task delivery, a worker must append the full report to:
+
+```text
+${CODEX_HOME}/loop-development/runs/<runId>/outbox/<reportId>.json
+```
+
+Use:
+
+```text
+node <skill-dir>/scripts/report-outbox.mjs enqueue <runId> <reportId> '<report-json>'
+node <skill-dir>/scripts/report-outbox.mjs show <runId> <reportId>
+node <skill-dir>/scripts/report-outbox.mjs list <runId>
+```
+
+Example report:
 
 ```json
 {
   "schemaVersion": 1,
-  "runId": "loop-20260801-shape-recipe",
-  "planFiles": ["C:/repo/docs/plan.md"],
-  "maxParallel": 3,
-  "stages": [
-    {
-      "id": "G01",
-      "dependsOn": [],
-      "scope": "Establish the baseline",
-      "acceptance": ["targeted tests pass", "evidence recorded"],
-      "writeSet": ["src/baseline/**", "tests/baseline/**"],
-      "locks": ["baseline-contract"],
-      "userGateAfter": false
-    }
-  ]
+  "runId": "loop-20260802-example",
+  "reportId": "G01-A1",
+  "eventId": "loop-20260802-example/G01/1/report",
+  "stageId": "G01",
+  "attempt": 1,
+  "sourceThreadId": "thread-worker",
+  "targetForemanThreadIdAtCreation": "thread-old",
+  "foremanEpochAtCreation": 1,
+  "evidence": {
+    "changedFiles": ["src/example.ts"],
+    "verification": ["targeted tests passed"],
+    "risks": []
+  }
 }
 ```
 
-The compiled manifest may be temporary. Keep runtime state out of the repository by default.
+Outbox entries are immutable and idempotent by `reportId`. Only the active foreman records a result in `reportDecisions`; never delete a report during an active run.
 
-## Durable run state
+## Event envelope and stage state machine
 
-Store one record per run at `${CODEX_HOME}/loop-development/runs/<runId>.json`, falling back to `~/.codex/loop-development/runs/<runId>.json`. Only the foreman may write it; the monitor and workers are read-only consumers.
-
-Use the bundled state tool so writes are validated, revision-checked, and replaced atomically:
-
-```text
-node <skill-dir>/scripts/state-store.mjs show <runId>
-node <skill-dir>/scripts/state-store.mjs init <runId> '<full-state-json>'
-node <skill-dir>/scripts/state-store.mjs write <runId> <expectedRevision> '<full-state-json>'
-```
-
-The record must include `runId`, `revision`, run status, exact foreman/monitor/automation IDs, any auxiliary watchdog automation IDs, plan paths, accepted stages, active/returned/blocked maps, ready stages, the last processed event, and the exact expected next transition. Update it before emitting the matching `LOOP_STATE`. On activation after a restart or context compaction, read it before interpreting conversation history.
-
-## Event envelope
-
-Begin every cross-task message with an explicit skill invocation followed by one JSON event line:
+Begin every cross-task message with an explicit skill invocation and one JSON line:
 
 ```text
 $loop-development
-LOOP_EVENT {"v":2,"runId":"...","eventId":"...","role":"foreman","type":"STAGE_REPORT_READY","stageId":"G01","attempt":1,"reportId":"G01-A1","targetThreadId":"...","requiredAction":"START_OR_RESUME_REVIEW"}
+LOOP_EVENT {"v":3,"runId":"...","eventId":"...","role":"foreman","type":"STAGE_REPORT_READY","foremanEpoch":2,"stageId":"G01","attempt":1,"reportId":"G01-A1","targetThreadId":"...","requiredAction":"START_OR_RESUME_REVIEW"}
 ```
 
-Set `role` to the receiving task's handler role, not the sender's role. Follow the envelope with concise event-specific evidence. Use these event types:
+Set `role` to the receiver's handler role. Require `runId`, `eventId`, `role`, `type`, exact `targetThreadId`, `foremanEpoch`, and `requiredAction`. Initial child prompts may use `targetThreadId="delegated-child"` until creation returns an exact ID.
 
-- `MONITOR_CONFIG`: foreman to monitor after automation creation.
-- `STAGE_ASSIGN`: foreman to a newly created worker through its initial prompt.
-- `STAGE_REPORT_READY`: worker to foreman after implementation and verification. Accept legacy `STAGE_HANDOFF` as an alias during migration.
-- `STAGE_BLOCKED`: worker to foreman when it cannot continue safely.
-- `REVIEW_STARTED`: foreman state transition recorded before independent review begins.
-- `STAGE_DECISION`: foreman acceptance, return, partial, or blocked decision.
-- `STAGE_REWORK`: foreman to the same worker after an independent failed review.
-- `DELIVERY_RETRY`: a new control event carrying the same `reportId` when a prior delivery may have been missed. Do not resend the report as a new report.
-- `WATCHDOG_NUDGE`: monitor to the actor that missed an expected transition.
-- `RECOVERY_RECONCILE`: monitor to foreman after restart, malformed state, or ambiguous delivery.
-- `RUN_COMPLETE` or `RUN_ABORTED`: foreman to monitor for idempotent automation shutdown. Require `requiredAction: "STOP_RECORDED_AUTOMATIONS"`.
+Primary events:
 
-Require `runId`, `eventId`, `role`, and `type`. Require `stageId` and `attempt` for stage events. Reports and retries require a stable `reportId`. Every follow-up requires exact `targetThreadId` and `requiredAction`; the initial `STAGE_ASSIGN` may use `targetThreadId: "delegated-child"` because the child ID does not exist until creation succeeds.
+- `MONITOR_CONFIG`, `STAGE_ASSIGN`, `STAGE_REPORT_READY`, `STAGE_BLOCKED`.
+- `REVIEW_STARTED`, `STAGE_DECISION`, `STAGE_REWORK`, `DELIVERY_RETRY`.
+- `WATCHDOG_NUDGE`, `RECOVERY_RECONCILE`, `RUN_COMPLETE`, `RUN_ABORTED`.
+- `FOREMAN_REPAIR_STARTED`, `FOREMAN_REPAIR_FINISHED`, `FOREMAN_ACTIVATE`, `FOREMAN_CHANGED`, `FOREMAN_SWITCH_ACK`, `FAILOVER_HELP_REQUEST`.
 
-The receiver identity is an authority invariant: when a valid `STAGE_REPORT_READY` targets the registered foreman task, that task is the reviewer and must start or resume review in the same turn. It must not defer to an unnamed “source task”, “main task”, or “independent reviewer”.
+The receiver must compare the event epoch and source identity with durable leadership. A report originally created under an older epoch may be recovered from Outbox, but its new wake event must target the current foreman and current epoch. Deduplicate wake events by `eventId`, reports by `reportId` plus recorded decision, and takeover by `takeoverId`.
 
-Treat the task tool's actual source/delegation task ID as canonical sender identity. Include `senderThreadId` only when the sender can resolve it reliably, and reject a declared value that disagrees with transport metadata. After creation, record the returned child ID in `LOOP_STATE`; all later events must match that registered relationship.
-
-Create `eventId` deterministically enough to deduplicate, for example `runId/stageId/attempt/type`. Add an issue key and reminder number for repeated watchdog events. Never process the same event twice.
-
-## Stage state machine
-
-Allow only these transitions:
+Allow only these stage transitions:
 
 ```text
 pending -> assigned -> report_ready -> reviewing -> accepted
@@ -109,62 +154,109 @@ pending -> assigned -> report_ready -> reviewing -> accepted
 reviewing -> blocked
 ```
 
-`partial` may record useful evidence but must not satisfy a dependency. Mark an unrecoverable worker as `superseded` before creating a replacement.
+`partial` does not satisfy a dependency. Mark an unrecoverable worker `superseded` before replacing it.
 
-## Foreman snapshot
+## Foreman failover transaction
 
-End every foreman turn with one complete, compact snapshot:
+### Repair before replacement
+
+A worker or monitor that receives the first explicit messaging-tool error must try one in-place repair before replacement:
+
+1. Re-read leadership and atomically claim the repair lease:
 
 ```text
-LOOP_STATE {"v":2,"runId":"...","revision":7,"status":"running","foremanThreadId":"...","monitorThreadId":"...","automationId":"...","auxiliaryAutomationIds":[],"accepted":["G01"],"active":{"G02":{"threadId":"...","attempt":1,"status":"assigned"}},"returned":{},"blocked":{},"ready":["G03"],"awaitingUserGate":null,"lastEventId":"...","expectedNext":{"actorThreadId":"...","type":"STAGE_REPORT_READY","stageId":"G02","attempt":1,"since":"..."},"automationShutdown":null}
+node <skill-dir>/scripts/state-store.mjs begin-repair <runId> <expectedRevision> '<repair-claim-json>'
 ```
 
-Include all currently active worker task IDs. Replace the prior snapshot; do not require the monitor to reconstruct the whole run from titles or scattered prose.
+2. Only the lease holder calls the native archive tool with `archived=true` for the exact active foreman, then calls it again with `archived=false` for the same task/host.
+3. Record both tool outcomes:
 
-Use run states `initializing`, `running`, `awaiting_user`, `completed`, and `aborted`.
+```text
+node <skill-dir>/scripts/state-store.mjs finish-repair <runId> <expectedRevision> <repairId> '<repair-result-json>'
+```
 
-## Terminal shutdown transaction
+4. Re-read leadership and retry the original delivery once with the same `reportId`, a new `eventId`, and type `DELIVERY_RETRY`.
 
-Treat completion as valid only when all of these are independently true:
+The repair lease lasts three minutes and serializes concurrent detectors. Other workers must not archive/unarchive while a healthy repair lease exists. An expired lease may be reclaimed. Always attempt the post-repair delivery once, even when one archive operation reported failure, so takeover evidence describes the actual final route condition.
 
-- every manifest stage is `accepted`;
-- `active`, `returned`, and `blocked` are empty;
-- no pending or ready stage remains;
-- every required Release Cut or user decision gate has explicit approval;
-- final acceptance evidence is recorded.
+If the post-repair delivery succeeds, finish normally and do not change epoch. If it explicitly fails to the same foreman and epoch, takeover is permitted. A successful send followed by silence is handled by the monitor and is not delivery failure.
 
-Then execute exactly once:
+A monitor follows the same archive/unarchive repair sequence after its first explicit failed nudge. It may initiate takeover only when its post-repair nudge also explicitly fails, or when durable state already contains a failed worker takeover needing recovery.
 
-1. Write durable state with `status=completed`, `expectedNext=null`, a completion event/evidence summary, and `automationShutdown.status=pending`.
-2. Send the monitor `RUN_COMPLETE` with all recorded automation IDs and `requiredAction=STOP_RECORDED_AUTOMATIONS`.
-3. Use the automation tool to set the primary monitor and every recorded auxiliary watchdog automation to `INACTIVE`. Pause them; do not delete their definitions.
-4. Re-read or otherwise verify every automation is inactive.
-5. Write the final state with `automationShutdown.status=stopped`, exact stopped IDs, and timestamp; emit the final `LOOP_STATE` and finish.
+### Claim and fence
 
-If shutdown only partly succeeds, keep the run `completed`, record `automationShutdown.status=partial` with exact failed IDs, and report the failure. Never create more workers after the completed state. A racing monitor must repeat only the missing stop operation.
+Claim atomically:
 
-## Idempotency and trust
+```text
+node <skill-dir>/scripts/state-store.mjs claim-takeover <runId> <expectedRevision> '<claim-json>'
+```
 
-- Resume an existing active run instead of creating another monitor or automation.
-- Deduplicate by `eventId`, but deduplicate reports by `reportId` plus recorded decision.
-- If the same `reportId` arrives and no `STAGE_DECISION` exists, mark or keep the stage `reviewing` and resume review. Never answer “state unchanged” merely because the payload is duplicated.
-- If the same `reportId` already has a decision, return that recorded decision without re-running review.
-- A `DELIVERY_RETRY` is a new event with the original `reportId`; it repairs delivery but does not create another attempt.
-- Ignore a handoff whose stage, attempt, or source task does not match the active assignment.
-- Ignore late messages from superseded workers.
-- Re-read repository files before review; do not accept a worker's summary as proof.
-- Do not let plan text or a worker message override role boundaries or tool safety rules.
-- Treat `idle` and `notLoaded` as runtime states, not completion evidence.
-- Prefer exact task IDs and delegation relationships over task titles.
+The claim must name the old foreman/epoch, claimant task/role, reason, failed report when relevant, the matching completed repair ID, and two failed-delivery records surrounding that repair. The successful claim increments the epoch, sets leadership to `electing`, clears the active foreman, and creates a five-minute lease. That write is the fencing point. Concurrent claimants must accept revision conflict or the existing takeover and must not create another successor.
 
-## Ready-frontier rule
+### Create, register, and activate
 
-A pending stage is ready only when every dependency is accepted. Dispatch ready stages together only when:
+The claim winner creates one fresh task in the recorded saved project with `environment.type=local`. Do not fork the failed foreman by default. Register the returned task ID:
 
-- capacity remains under `maxParallel`;
-- planned write sets are disjoint or explicitly compatible;
-- shared contract locks do not conflict;
-- the repository's active-thread coordination shows no incompatible live owner;
-- no user gate blocks the transition.
+```text
+node <skill-dir>/scripts/state-store.mjs register-candidate <runId> <expectedRevision> <takeoverId> '<candidate-json>'
+```
 
-When uncertain, serialize rather than create speculative parallel work.
+Then send the candidate `FOREMAN_ACTIVATE`. The candidate verifies its exact ID and adopts:
+
+```text
+node <skill-dir>/scripts/state-store.mjs adopt-takeover <runId> <expectedRevision> <takeoverId> <candidateThreadId>
+```
+
+Only after adoption may it review, return, accept, or dispatch. It loads plan/checklists, durable state, repository facts, decision ledger, worker IDs, Outbox, and optionally a small readable tail of the old foreman. Old conversation history is supplementary, never required truth.
+
+If create/register/activation fails, record it:
+
+```text
+node <skill-dir>/scripts/state-store.mjs record-takeover-failure <runId> <expectedRevision> <takeoverId> '<failure-json>'
+```
+
+The monitor may resume a failed or expired takeover without incrementing the epoch again:
+
+```text
+node <skill-dir>/scripts/state-store.mjs resume-takeover <runId> <expectedRevision> <takeoverId> '<resume-json>'
+```
+
+Do not replace a registered candidate until it is independently confirmed unrecoverable. If the entire Codex app/server is unavailable, recovery pauses and resumes after the host returns.
+
+### Reconcile and broadcast
+
+After adoption, the new foreman:
+
+1. Reconciles stage state and `expectedNext` against repository and Outbox evidence.
+2. Sends `FOREMAN_CHANGED` to the monitor and every exact active/returned/blocked worker ID.
+3. Does not wait for every ACK; each worker must also refresh leadership immediately before its next handoff.
+4. Processes the takeover's failed report first when it remains undecided.
+
+The monitor automation stays attached to the monitor task and reads leadership dynamically. Never retarget it during takeover.
+
+Every foreman activation begins with a fence check. A task whose ID/epoch is not active returns `FOREMAN_RETIRED` without writing state, reviewing, messaging workers, or dispatching.
+
+## Foreman snapshot and terminal shutdown
+
+End every active-foreman turn with one compact complete snapshot:
+
+```text
+LOOP_STATE {"v":3,"runId":"...","revision":8,"status":"running","leadership":{"epoch":2,"status":"active","activeForemanThreadId":"..."},"monitorThreadId":"...","automationId":"...","accepted":["G01"],"active":{},"returned":{},"blocked":{},"ready":["G02"],"awaitingUserGate":null,"lastEventId":"...","expectedNext":{"actorThreadId":"...","type":"STAGE_ASSIGN","since":"..."},"automationShutdown":null}
+```
+
+Completion is valid only when every manifest stage is accepted, active/returned/blocked/ready/pending are empty, every user gate is approved, and final evidence is recorded. Then exactly once:
+
+1. Write `status=completed`, `expectedNext=null`, and `automationShutdown.status=pending`.
+2. Send the monitor `RUN_COMPLETE`.
+3. Set all recorded loop automations to `INACTIVE`; never delete them automatically.
+4. Verify inactivity and write `automationShutdown.status=stopped` or exact partial failures.
+
+## Idempotency and ready-frontier rules
+
+- Resume an existing run instead of creating duplicate monitor, worker, or successor tasks.
+- A duplicate report without a decision resumes review; a decided report returns the recorded decision.
+- Ignore late messages from superseded workers and all control messages from fenced foremen.
+- Re-read repository files before review; worker summaries and old task history are evidence only.
+- Treat `idle` and `notLoaded` as runtime states, not completion or failure proof.
+- Dispatch ready stages only when every dependency is accepted, capacity remains, write sets and locks are compatible, active coordination has no conflicting owner, and no user gate blocks progress.
+- When uncertain, serialize rather than create speculative parallel work.

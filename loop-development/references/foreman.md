@@ -1,89 +1,85 @@
 # Foreman Role
 
-## Startup handler
+## Fence check on every activation
+
+Read durable state before interpreting any report, nudge, user continuation, or task summary.
+
+- Continue only when the current task ID equals `leadership.activeForemanThreadId` and its epoch matches the event.
+- While leadership is `electing`, no old foreman may review, dispatch, message workers, or write execution state.
+- If this task is listed in `previousForemanThreadIds` or another leader is active, return `FOREMAN_RETIRED` with the current leader/epoch and perform no further action.
+- Pass the current foreman ID and epoch to every generic state write so the state tool can fence stale writers.
+
+## Initial startup handler
 
 When the user says “开始循环开发”:
 
-1. Read the governing `AGENTS.md` files and repository instructions.
-2. Prefer plan/checklist paths explicitly mentioned in the current task. Otherwise search the repository's plan and checklist locations and require one unambiguous active plan.
-3. Inspect current repository tasks and automations for an existing matching `runId`. Resume it when healthy; do not duplicate it.
-4. Read the durable run state. If it exists, reconcile it before using conversational summaries. Otherwise compile the plan contract and initialize the state with the bundled state tool.
-5. Check the live working tree and active-thread coordination before choosing a ready frontier.
-6. Create one projectless monitor task. Explicitly select `gpt-5.6-luna` with `xhigh`. Its initial prompt must invoke `$loop-development` with `role=monitor`, identify the run and plan, and tell it to learn the foreman ID from the delegation source.
-7. Create a 20-minute heartbeat automation inside the monitor task. Use failure-only notifications. Make its prompt explicitly invoke `$loop-development` with `role=monitor` and the current `runId`. The automation target must remain the monitor task.
-8. Record the monitor and automation IDs in durable state, then send the monitor one `MONITOR_CONFIG` event containing its task ID, automation ID, state path, plan paths, and current thresholds. Do not wait for an acknowledgment.
-9. Create one implementation task for each selected ready stage. Follow the active repository's saved-project and environment rules. Assign exactly one stage per task.
-10. Record each created task and expected next transition in durable state, emit a complete `LOOP_STATE`, and finish the turn. Do not wait for worker progress.
+1. Read governing repository instructions and resolve one unambiguous plan/checklist set.
+2. Inspect tasks and automations for an existing matching `runId`; resume instead of duplicating.
+3. Resolve the saved project's exact `projectId`, cwd, and `local` environment. Persist them for successor creation.
+4. Initialize schema-2 durable state with this task as epoch-1 active foreman, project facts, plan paths, decision ledger, and empty report decisions.
+5. Check the working tree and coordination before choosing a ready frontier.
+6. Create one projectless `gpt-5.6-luna` monitor with `xhigh` reasoning.
+7. Create a 20-minute heartbeat automation inside the monitor task with failure-only notifications. Its prompt contains `runId` and state path, never a permanently hard-coded foreman ID.
+8. Record monitor and automation IDs, then send `MONITOR_CONFIG` with project facts, state path, plan paths, and thresholds.
+9. Create one local-project implementation task per selected ready stage, explicitly selecting `gpt-5.6-luna` with `max` reasoning, and record exact IDs.
+10. Write state, emit `LOOP_STATE`, and finish without polling.
 
-If setup fails before any worker is created, cleanly report the partial resources that exist. Do not pretend the loop is running.
+If setup fails before workers exist, report partial resources. Do not pretend the loop is running.
 
 ## Worker assignment
 
-Put these facts in every initial worker prompt:
+Every initial worker prompt must contain:
 
-- `$loop-development`, receiver `role=worker`, and a `STAGE_ASSIGN` envelope whose initial target may be `delegated-child`.
-- Source plan and checklist paths.
-- Stage ID, attempt, scope, dependencies, and accepted prerequisites.
-- Allowed write set and forbidden shared areas.
-- Contract locks and decisions that must be preserved.
-- Required verification and handoff evidence.
-- The rule that the worker cannot self-accept or create downstream tasks.
-- The rule that handoff/blocking must be sent to the delegation source as the last tool action.
-- Repository-specific branch, worktree, commit, documentation, and coordination rules.
+- `$loop-development`, receiver `role=worker`, current foreman ID and epoch.
+- `runId`, state path, monitor ID, project ID/cwd/environment, plan/checklist paths.
+- The persisted worker profile `model=gpt-5.6-luna`, `thinking=max`; use it for this worker and every downstream worker created after acceptance.
+- Stage ID, attempt, scope, dependencies, accepted prerequisites, write set, locks, verification, and evidence requirements.
+- The Outbox-before-message rule and two-explicit-failure takeover procedure.
+- The worker authority boundary and repository-specific Git/documentation/coordination rules.
 
-Use the created task ID returned by the tool in the foreman snapshot. Do not identify workers by title alone.
+Use returned task IDs in state. Never identify participants by title alone.
 
 ## Incoming report handler
 
-On `STAGE_REPORT_READY` or legacy `STAGE_HANDOFF`:
+On `STAGE_REPORT_READY`, `DELIVERY_RETRY`, or legacy `STAGE_HANDOFF`:
 
-1. Load durable state, then validate receiver `role=foreman`, exact `targetThreadId`, `runId`, `eventId`, `reportId`, stage, attempt, and actual source task ID.
-2. If this exact `reportId` already has a decision, return that decision and stop. If it has no decision, continue even when the payload is a duplicate.
-3. Treat the current task as the sole reviewer. Never wait for a separate “main review task” when the event targets this registered foreman.
-4. Record `REVIEW_STARTED` and `expectedNext=STAGE_DECISION` in durable state before inspecting code.
-5. Inspect current files and diffs independently.
-6. Run the acceptance checks proportionate to risk. Worker self-tests are evidence, not acceptance.
-7. Decide exactly one result:
-   - `accepted`: record evidence and unlock dependencies.
-   - `partial`: record useful evidence without unlocking dependencies.
-   - `returned`: send precise, bounded rework to the same worker.
-   - `blocked`: record the blocker and either resolve it or ask the user.
-8. Record one `STAGE_DECISION` in durable state before messaging or dispatching.
-9. If accepted, compute the ready frontier and immediately create any safe next tasks up to capacity.
-10. If returned, send `STAGE_REWORK` with receiver `role=worker` to the existing worker. Include failed checks, required changes, preserved decisions, and the incremented attempt.
-11. Record the resulting expected next transition, emit the new full `LOOP_STATE`, and finish the turn.
+1. Pass the fence check, then validate target ID, current epoch, `runId`, `eventId`, `reportId`, stage, attempt, and actual source worker ID.
+2. Load the immutable Outbox report. A wake message is not the report's source of truth.
+3. If `reportDecisions[reportId]` exists, return the recorded decision and stop. Otherwise continue even if the wake event is duplicated.
+4. Record `REVIEW_STARTED` and `expectedNext=STAGE_DECISION` before inspection.
+5. Inspect current files and diffs independently and run proportionate acceptance checks.
+6. Record exactly one accepted, partial, returned, or blocked result in stage state, `reportDecisions`, and the decision ledger.
+7. If accepted, compute and dispatch the safe ready frontier. If returned, send precise rework to the same worker with the incremented attempt.
+8. Write resulting state with the current leader ID/epoch, emit `LOOP_STATE`, and finish.
 
-Review one completed worker even when sibling workers remain active. Do not wait for the whole batch before recording an independent result. New work may be dispatched only when dependencies and resource locks allow it.
+Review completed workers independently even while siblings remain active. Never wait for the whole batch.
 
-## Incoming blocked handler
+## Successor activation handler
 
-On `STAGE_BLOCKED`, verify the blocker. Resolve repository-local issues when authorized; otherwise record `blocked` and ask the user only when a real decision or new authority is required. Do not have the monitor decide.
+On `FOREMAN_ACTIVATE`:
+
+1. Read state and require leadership `electing`, matching takeover ID, exact registered candidate ID, and event target equal to this task.
+2. Call `adopt-takeover`. If state already shows this task active at the takeover epoch, treat activation as idempotently complete. If another task is active, retire.
+3. Reload state, plan/checklists, repository status, decision ledger, exact worker IDs, and Outbox. Optionally read only a small recent tail of the old foreman when available; never require it.
+4. Reconcile the takeover's saved `resumeExpectedNext`, current stage maps, repository evidence, and undecided reports. Fail closed on conflict.
+5. Send `FOREMAN_CHANGED` to the monitor and every exact active/returned/blocked worker ID. Include old/new IDs, new epoch, takeover ID, and `requiredAction=UPDATE_FOREMAN_ROUTE`. Do not wait for every ACK.
+6. Process `failedReportId` first when its Outbox report remains undecided; otherwise resume the oldest verified missing transition.
+7. Write the reconciled execution state, emit a complete `LOOP_STATE`, and finish after review, rework, or dispatch.
+
+The creator of a successor is not its authority. Authority comes only from the registered takeover and successful adoption.
 
 ## Watchdog and restart handler
 
-On `WATCHDOG_NUDGE` or `RECOVERY_RECONCILE`:
+On `WATCHDOG_NUDGE` or `RECOVERY_RECONCILE`, pass the fence check, read durable state, and inspect only evidence needed for the named transition. Resume a delivered undecided report; emit only a missing rework/dispatch action when its decision already exists. Repair disagreement from independently verified task and repository evidence.
 
-1. Read durable state first, then inspect only the task history needed to verify the named missing transition.
-2. If a report is delivered without a decision, start or resume review; do not request the worker to resend its full report.
-3. If a decision exists without its required rework message or next assignment, emit only that missing action.
-4. If durable state and task history disagree, fail closed, repair the state from independently verified tool evidence, and emit a new full snapshot.
-
-Do not retarget a monitor automation to the foreman. Create, repair, or replace an independent monitor instead. Outside initial setup, run completion, confirmed monitor replacement, or an explicit user request, do not modify automation configuration.
+Do not retarget monitor automation to this task. Outside initial setup, terminal shutdown, confirmed monitor replacement, or explicit user request, do not modify automation configuration.
 
 ## Gates and completion
 
-At a user gate, set run status to `awaiting_user`, include the decision and evidence needed, and finish without dispatching beyond the gate.
+At a user gate, write `awaiting_user` and finish without dispatching beyond it.
 
-When all stages are accepted and final user gates have passed:
-
-1. Re-read the plan/manifest and durable state. Require every stage accepted; require `active`, `returned`, `blocked`, `ready`, and pending work to be empty; require every user gate explicitly passed.
-2. Write durable state with status `completed`, `expectedNext=null`, final evidence, and `automationShutdown.status=pending`.
-3. Send `RUN_COMPLETE` to the monitor with the primary and auxiliary automation IDs and `requiredAction=STOP_RECORDED_AUTOMATIONS`.
-4. Use the automation tool to set every recorded loop automation to `INACTIVE`; never delete it automatically.
-5. Verify all recorded automations are inactive. Write `automationShutdown.status=stopped` with IDs and timestamp, emit the final complete `LOOP_STATE`, and finish.
-
-If only some automations stop, record `automationShutdown.status=partial` and the exact failed IDs, report the failure, and finish without creating work. Never infer completion merely because workers are idle or because the last numbered stage submitted a report.
+Complete only after every stage is accepted, all stage maps and pending/ready work are empty, every user gate is approved, and final evidence is recorded. Write `completed`, notify the monitor, set all recorded automations `INACTIVE`, verify them, record stopped or partial shutdown status, emit the final snapshot, and finish. Never infer completion from idle workers or the last numbered report.
 
 ## Turn termination rule
 
-After creating tasks or sending rework, finish the current turn. Do not repeatedly call task-read or task-wait tools to watch workers. A single immediate creation check is allowed only to capture returned task IDs or a setup error.
+After creating tasks, sending rework, broadcasting takeover, or dispatching the next frontier, finish the turn. Do not repeatedly read or wait on workers. A single immediate check is allowed only to capture returned IDs or a setup error.

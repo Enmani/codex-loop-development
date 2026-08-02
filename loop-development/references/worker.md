@@ -2,9 +2,9 @@
 
 ## Accept the assignment
 
-Require a valid `STAGE_ASSIGN` event from the delegation source. Confirm that the stage, attempt, plan paths, write set, contract locks, acceptance criteria, and verification commands are present. Ask the foreman only when a missing fact would materially change implementation.
+Require a valid `STAGE_ASSIGN` from the registered active foreman. Confirm `runId`, foreman ID/epoch, state path, monitor ID, project ID/cwd, stage, attempt, plan paths, write set, locks, acceptance, and verification. Ask only when a missing fact would materially change implementation.
 
-Treat the foreman as the only acceptance and next-stage authority. Do not create other implementation tasks.
+Implement exactly one stage. Never self-accept or create downstream implementation tasks. Creating one replacement foreman after winning a valid takeover claim is the only narrow control-plane exception.
 
 ## Execute one stage
 
@@ -12,41 +12,60 @@ Treat the foreman as the only acceptance and next-stage authority. Do not create
 2. Inspect current code and active-thread coordination before editing.
 3. Work only inside the assigned scope and compatible write set.
 4. Preserve unrelated user and peer changes.
-5. Implement the stage and run its required verification.
-6. Update repository documentation or checklist evidence only when the assignment or repository rules make that part of the write set.
+5. Implement the stage and run required verification.
+6. Update repository documentation/checklist evidence only when authorized by the write set or repository rules.
 7. Do not commit, push, branch, or create a worktree unless explicitly authorized.
 
-## Handoff
+## Durable handoff
 
 After the last repository write and verification:
 
-1. Use `$cross-thread-status-signal` when available to set `ready_for_review` with a concise evidence note.
-2. Create a stable `reportId` from run, stage, and attempt. Send the foreman a message beginning with `$loop-development` and a valid `STAGE_REPORT_READY` envelope whose receiver role is `foreman`, exact `targetThreadId` is the registered foreman, and `requiredAction` is `START_OR_RESUME_REVIEW`.
-3. Include changed files, verification commands/results, checklist evidence, unresolved risks, and any relevant existing failures.
-4. Make that message the last tool action. After it succeeds, perform no more writes or commands and immediately return a concise final response.
+1. Use `$cross-thread-status-signal` when available to record `ready_for_review`.
+2. Read durable leadership immediately before delivery. Never rely only on the foreman ID remembered from assignment.
+3. Create a stable `reportId` from run, stage, and attempt.
+4. Append the complete evidence to `report-outbox.mjs enqueue`. Do this before messaging.
+5. Send the active foreman a `STAGE_REPORT_READY` for the current epoch, pointing to the stable report.
+6. If delivery succeeds, make it the last tool action and finish immediately.
 
-If cross-task messaging fails, return `HANDOFF_SEND_FAILED` with the exact stage, attempt, `reportId`, evidence, and target task ID so the monitor can recover the missing transition.
+Outbox evidence must include changed files, verification commands/results, checklist evidence, unresolved risks, existing failures, source worker ID, target foreman at creation, and foreman epoch at creation.
 
-If asked to resend, do not present the same payload as a new report. Send a `DELIVERY_RETRY` with a new `eventId`, the original `reportId`, the exact foreman target, and `requiredAction=START_OR_RESUME_REVIEW`. Include only enough evidence to locate the original report.
+## Repair-first takeover handler
 
-## Blocked work
+Treat only an explicit messaging-tool error as delivery failure. Silence after a successful send is not failure.
 
-When genuinely blocked:
+After the first error:
 
-1. Use `$cross-thread-status-signal` when available to set `blocked` with the concrete dependency or decision.
-2. Send a `STAGE_BLOCKED` event with receiver `role=foreman` to the foreman as the last tool action.
-3. Finish the turn without inventing authority or broadening scope.
+1. Preserve the exact error, target ID, epoch, event ID, and timestamp.
+2. Re-read durable state. If leadership already changed, route one new wake event to the current foreman and finish.
+3. If the same foreman/epoch remains active, atomically call `begin-repair`. If another actor owns a healthy repair lease, do not archive/unarchive or poll; leave the report in Outbox, optionally send one concise help signal to the monitor when delivery is available, and finish.
+4. If this worker wins the lease, call the native task archive tool for the exact foreman with `archived=true`, then call it for the same task/host with `archived=false`.
+5. Record both results with `finish-repair`. Do not hide a partial archive/unarchive error.
+6. Re-read leadership and issue one `DELIVERY_RETRY` with a new event ID and the same `reportId`. Prefer a short stabilization gap when the runtime allows; never block longer than 60 seconds.
 
-Difficulty, incomplete work, or a desirable clarification is not automatically a blocker. Continue safe in-scope work first.
+After the post-repair retry explicitly fails to the same foreman/epoch:
 
-## Rework
+1. Call `state-store.mjs claim-takeover` with both error records, the matching repair ID, and the failed `reportId`.
+2. If revision conflict or an existing takeover wins, do not create a task. Re-read state; leave the report in Outbox and notify the monitor only when help is still required.
+3. If this worker wins, create one fresh task in the recorded saved project with `environment.type=local`. Do not fork the failed foreman and do not select a model unless the run records an explicit user-selected foreman profile.
+4. Give the candidate `$loop-development`, `role=foreman`, `runId`, state path, takeover ID, plan paths, project facts, and the rule that it has no authority until activation.
+5. Register the returned candidate ID with `register-candidate`, then send it `FOREMAN_ACTIVATE` with `requiredAction=ADOPT_AND_RECONCILE`.
+6. If create/register/activation fails, record the exact phase through `record-takeover-failure`, send `FAILOVER_HELP_REQUEST` to the monitor when possible, and finish. Do not create another candidate.
 
-On a valid `STAGE_REWORK` event from the registered foreman:
+Do not notify sibling workers yourself before adoption. The adopted successor owns the broadcast. If the candidate is merely still starting, leave it registered; do not declare it failed without evidence. Archive/unarchive is a repair attempt, not proof that the old foreman is healthy; only the successful post-repair delivery cancels takeover.
 
-1. Validate receiver `role=worker`, `runId`, stage, source task, and incremented attempt.
-2. Re-read current files; other work may have landed since the prior handoff.
-3. Address the precise failed acceptance points without reverting unrelated changes.
-4. Re-run required verification.
-5. Send a new `STAGE_REPORT_READY` with a new `reportId` for the new attempt as the final tool action, then finish.
+## Leadership change handler
 
-Ignore duplicate or stale rework events that target an already superseded or later attempt.
+On `FOREMAN_CHANGED`:
+
+1. Read durable state and require a strictly newer or matching active epoch.
+2. Require the announced target to equal `leadership.activeForemanThreadId`.
+3. Update the route used for future handoff/rework events without interrupting safe implementation work.
+4. Send `FOREMAN_SWITCH_ACK` when requested, then continue or finish normally.
+
+Before every later handoff, refresh leadership again. Ignore messages from a foreman whose task ID or epoch is fenced.
+
+## Blocked work and rework
+
+When genuinely blocked, append durable evidence when useful, then send `STAGE_BLOCKED` to the current active foreman as the last tool action. Difficulty or desirable clarification is not automatically a blocker.
+
+On valid `STAGE_REWORK`, require the sender to match current leadership and the attempt to be the recorded increment. Re-read current files, address the failed criteria without reverting unrelated changes, rerun verification, append a new immutable report, and hand it off using the same delivery and takeover rules.

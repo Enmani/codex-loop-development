@@ -23,6 +23,7 @@ Require-File (Join-Path $sourceSkill "references\foreman.md")
 Require-File (Join-Path $sourceSkill "references\worker.md")
 Require-File (Join-Path $sourceSkill "references\monitor.md")
 Require-File (Join-Path $sourceSkill "scripts\state-store.mjs")
+Require-File (Join-Path $sourceSkill "scripts\report-outbox.mjs")
 Require-File (Join-Path $sourceSkill "scripts\validate-manifest.mjs")
 
 $node = Get-Command node -ErrorAction Stop
@@ -32,6 +33,11 @@ $syncScript = Join-Path $userHome ".agents\bin\sync-agents.mjs"
 & $node.Source --check (Join-Path $sourceSkill "scripts\state-store.mjs")
 if ($LASTEXITCODE -ne 0) {
   throw "Packaged state-store.mjs failed the Node syntax check"
+}
+
+& $node.Source --check (Join-Path $sourceSkill "scripts\report-outbox.mjs")
+if ($LASTEXITCODE -ne 0) {
+  throw "Packaged report-outbox.mjs failed the Node syntax check"
 }
 
 & $node.Source --check (Join-Path $sourceSkill "scripts\validate-manifest.mjs")

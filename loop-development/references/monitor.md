@@ -2,64 +2,70 @@
 
 ## Boundary
 
-Act only as a watchdog for a single `runId`. Never become the foreman.
+Act only as watchdog for one `runId`. Never review, accept, modify repository files, choose a stage, create implementation tasks, cross a user gate, or infer membership from titles.
 
-Do not:
+The monitor may create one replacement foreman only when it wins or resumes the bounded takeover protocol. It never adopts that role; the candidate must adopt itself from durable state.
 
-- edit repository files;
-- run builds or tests;
-- review or accept implementation;
-- create, replace, or archive implementation tasks;
-- choose the next stage;
-- cross a user gate;
-- infer membership from titles alone.
-
-Learn the foreman task ID from the bootstrap delegation source. Accept `MONITOR_CONFIG` only from that task. Keep the monitor projectless so normal polling does not enter the repository task context.
+Keep the monitor projectless. Its heartbeat automation always targets this monitor task and contains only the run/state reference needed to discover current leadership dynamically.
 
 ## Heartbeat procedure
 
 On each scheduled run:
 
-1. Read the durable run state first, then use the foreman's latest complete `LOOP_STATE` as a consistency check.
-2. Resolve current workers from its exact task IDs and, when needed, delegation/source relationships.
-3. Read compact immediate task-status snapshots. Do not repeatedly read unchanged histories.
-4. If the foreman or any current worker is making ordinary progress, return `NO_OP`.
-5. If the run is `awaiting_user`, return `NO_OP`.
-6. If the run is `completed` or `aborted`, set the primary and every recorded auxiliary loop automation to `INACTIVE`, verify the stop, and return `MONITOR_STOPPED`. Do not send reminders or create recovery tasks.
-7. Otherwise identify the single oldest missing expected transition from `expectedNext` and verified task evidence.
+1. Read durable state first, including leadership, takeover, project facts, exact participants, expected transition, and Outbox reports.
+2. If the run is `completed` or `aborted`, set recorded automations `INACTIVE`, verify, and return `MONITOR_STOPPED`.
+3. If `awaiting_user`, return `NO_OP` unless terminal automation cleanup is incomplete.
+4. If leadership is `electing`, execute only the takeover recovery procedure below.
+5. If the active foreman or any current worker is making ordinary progress, return `NO_OP`.
+6. Otherwise identify one oldest missing transition and apply at most one nudge.
 
-Use these default stale thresholds unless `MONITOR_CONFIG` overrides them:
+Default thresholds:
 
-- Ordinary idle gap before a reminder: 15 minutes.
-- Delivered report without `REVIEW_STARTED`: 5 minutes while the foreman is idle.
-- `REVIEW_STARTED` without `STAGE_DECISION`: 30 minutes while the foreman is idle; do not interrupt an active review unless the active-turn stall rule also fires.
-- Rework or acceptance without the corresponding worker activation or next assignment: 5 minutes while the responsible task is idle.
-- Same active turn before suspecting a stall: more than 90 minutes and two consecutive unchanged observations.
-- Same-issue reminder cooldown: 60 minutes.
-- Maximum reminders for the same unchanged issue: two; after that report `NEEDS_USER` in the monitor task and stop nudging it.
+- Ordinary idle gap: 15 minutes.
+- Outbox/delivered report without `REVIEW_STARTED`: 5 minutes while foreman is idle.
+- Review without decision: 30 minutes while foreman is idle.
+- Returned/accepted stage without worker activation or next assignment: 5 minutes.
+- Active-turn stall suspicion: over 90 minutes and two unchanged observations.
+- Same-issue cooldown: 60 minutes.
+- Maximum ordinary reminders: two, then `NEEDS_USER` unless the two sends themselves explicitly failed and qualify for takeover.
 
-## Missing-transition table
+## Missing-transition actions
 
-| Observed execution state | Expected actor | Allowed watchdog action |
-|---|---|---|
-| Stage assigned; registered worker idle/finished; no handoff | Worker | Send one `WATCHDOG_NUDGE` asking it to deliver or report the handoff |
-| Valid report delivered; foreman idle; no `REVIEW_STARTED` | Foreman | Send one `WATCHDOG_NUDGE` with the `reportId` and `requiredAction=START_OR_RESUME_REVIEW` |
-| Review started; foreman idle; no decision | Foreman | Send one `WATCHDOG_NUDGE` with `requiredAction=RESUME_REVIEW_AND_DECIDE` |
-| Stage returned; same worker idle; no new handoff | Worker | Send one `WATCHDOG_NUDGE` asking it to resume the recorded attempt |
-| Stage accepted; ready stages exist; foreman idle; no dispatch or gate | Foreman | Send one `WATCHDOG_NUDGE` asking it to reconcile and continue |
-| Active task appears stalled by threshold | Foreman | Send one `STUCK_SUSPECT`; do not create a replacement |
-| State is ambiguous after restart, state is malformed, or task lookup disagrees | Foreman | Send one `RECOVERY_RECONCILE`; do not replay the report |
+| Observed state | Action |
+|---|---|
+| Assigned worker idle/finished, no Outbox report | Nudge that worker to deliver or block |
+| Outbox report exists, active foreman idle, no review | Nudge active foreman with `reportId` |
+| Review started, no decision | Nudge active foreman to resume and decide |
+| Returned stage, same worker idle | Nudge worker to resume recorded attempt |
+| Accepted stage, ready frontier exists | Nudge active foreman to reconcile and continue |
+| State/task evidence ambiguous | Send `RECOVERY_RECONCILE` to active foreman |
+| First explicit nudge delivery fails | Claim repair lease, archive/unarchive active foreman, then retry once |
+| Post-repair nudge to the same leader/epoch also fails | Claim foreman takeover |
 
-Begin every nudge with `$loop-development` and a valid event envelope whose `role` names the receiving handler (`foreman` or `worker`). Include the issue key, exact target task, related stage/attempt/report ID, observed state, missing transition, and `requiredAction`. A nudge asks the responsible task to run its own role protocol; it must not contain an acceptance or dispatch decision or copy the full worker report.
+Each nudge invokes `$loop-development`, names the exact target and epoch, and asks only for the missing role action. Do not copy the full report or insert an acceptance/dispatch decision. Record error evidence, issue key, reminder number, and timestamp. Send at most one ordinary cross-task nudge per heartbeat.
 
-Send at most one cross-task message per heartbeat. Record issue key, observation, reminder count, and timestamp in the monitor conversation so later heartbeats can enforce cooldown without polluting the foreman.
+## Takeover recovery
 
-## Source and state checks
+### Claiming an active but unreachable foreman
 
-- Trust exact task IDs from `LOOP_STATE`, not similarly named tasks in the same repository.
-- Treat `idle` and `notLoaded` as non-terminal until a handoff or decision event proves completion.
-- Ignore unrelated workers from other runs.
-- If the latest foreman snapshot is malformed, ask the foreman to re-emit it; do not reconstruct acceptance from worker claims.
-- On the first heartbeat after app/server recovery, reconcile the durable state's `expectedNext` against actual delivery and decision events. Emit only the one missing control event.
-- Treat a valid `RUN_COMPLETE` or durable `status=completed` as terminal. Idempotently stop only still-active recorded automations; never delete them, and never restart or replace a monitor for a terminal run.
-- If message delivery fails, report the target and failure in the monitor task. Do not retry repeatedly in the same heartbeat.
+After the first explicit messaging-tool error, claim `begin-repair`, archive and unarchive the exact active foreman, record `finish-repair`, and issue one post-repair nudge. Only when that nudge also explicitly fails to the same foreman and epoch may the monitor call `claim-takeover` with the matching repair ID, `claimantRole=monitor`, and `reason=monitor-confirmed-unreachable`. Silence, `idle`, or `notLoaded` alone is insufficient.
+
+If another worker or monitor owns an unexpired repair lease, do not repeat archive/unarchive. If the repair lease expires, reclaim it and finish the same repair attempt before considering takeover.
+
+### Finishing an existing election
+
+When leadership is `electing`:
+
+1. If a registered candidate exists and has not been proven failed, send or retry one `FOREMAN_ACTIVATE` for that candidate. Do not create another.
+2. If creation/registration failed or the five-minute lease expired with no healthy candidate, call `resume-takeover` using the same takeover ID and epoch.
+3. Create one fresh task in the recorded saved project using `environment.type=local`, register it, and send `FOREMAN_ACTIVATE`.
+4. Record any create/register/activation error with `record-takeover-failure`; do not retry repeatedly in the same heartbeat.
+5. Never call `adopt-takeover`, review Outbox reports, or dispatch workers. The successor owns those actions.
+
+If task creation is unavailable because the Codex host is down, leave the takeover durable and retry after the host returns. After two failed recovery cycles for the same unchanged takeover, report `NEEDS_USER` and stop creating candidates until external state changes.
+
+## Leadership change handler
+
+On `FOREMAN_CHANGED`, verify the announced task and epoch against durable leadership, record `FOREMAN_SWITCH_ACK`, and continue monitoring. No automation retarget is required. Ignore messages from previous foremen and late workers from other runs.
+
+On the first heartbeat after app recovery, reconcile durable leadership and expected transition against actual task evidence. Emit only the earliest missing control event.
