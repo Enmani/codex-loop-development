@@ -16,7 +16,7 @@ When the user says “开始循环开发”:
 1. Read governing repository instructions and resolve one unambiguous plan/checklist set.
 2. Inspect tasks and automations for an existing matching `runId`; resume instead of duplicating.
 3. Resolve the saved project's exact `projectId`, cwd, and `local` environment. Persist them for successor creation.
-4. Initialize schema-2 durable state with this task as epoch-1 active foreman, project facts, plan paths, decision ledger, and empty report decisions.
+4. Compute a deterministic fingerprint over the ordered plan/checklist files. Initialize schema-2 durable state with this task as epoch-1 active foreman, project facts, plan paths, `planRevision=1`, the fingerprint, decision ledger, and empty report decisions.
 5. Check the working tree and coordination before choosing a ready frontier.
 6. Create one projectless `gpt-5.6-luna` monitor with `xhigh` reasoning.
 7. Create a 20-minute heartbeat automation inside the monitor task with failure-only notifications. Its prompt contains `runId` and state path, never a permanently hard-coded foreman ID.
@@ -32,6 +32,7 @@ Every initial worker prompt must contain:
 
 - `$loop-development`, receiver `role=worker`, current foreman ID and epoch.
 - `runId`, state path, monitor ID, project ID/cwd/environment, plan/checklist paths.
+- Current `planRevision` and `planFingerprint`; require the worker to report a plan gap instead of editing the governing plan.
 - The persisted worker profile `model=gpt-5.6-luna`, `thinking=max`; use it for this worker and every downstream worker created after acceptance.
 - Stage ID, attempt, scope, dependencies, accepted prerequisites, write set, locks, verification, and evidence requirements.
 - The Outbox-before-message rule and two-explicit-failure takeover procedure.
@@ -54,14 +55,32 @@ On `STAGE_REPORT_READY`, `DELIVERY_RETRY`, or legacy `STAGE_HANDOFF`:
 
 Review completed workers independently even while siblings remain active. Never wait for the whole batch.
 
+## Plan gap and amendment handler
+
+On `PLAN_GAP_FOUND`, or when review proves the current plan technically incomplete:
+
+1. Pass the fence check and load the cited Outbox evidence. Deduplicate by stable gap/report ID.
+2. Create or resume `planGapDecisions[gapId]`. If it is already `applied`, return the recorded revision and never amend again. First distinguish a plan defect from temporary unavailability or ordinary blocked work. If it is a defect, decide whether it is `technical-closure` or requires the user under the protocol boundary. Record the reasoning; do not disguise product or authority changes as technical cleanup.
+3. If the reporting worker's delivered gap says `safeBoundaryReached=true`, move that stage directly from active to blocked `plan_paused` in the gap-decision write; do not send a redundant pause. For each other affected active worker, set the gap decision to `pause_requested`, persist one exact stage as `plan_pause_requested` without releasing its locks/capacity, set `expectedNext=PLAN_PAUSE_ACK`, send one `PLAN_PAUSE`, and finish. On ACK, move it to blocked `plan_paused`, then repeat for the next affected worker. Do not edit concurrently with an unacknowledged affected worker.
+4. Only when every affected worker is durably paused, complete a fenced write setting the gap decision to `reconciling` and `expectedNext=PLAN_RECONCILE`, then edit only the governing plan/checklist files, preserve accepted history and stable stage IDs, validate the new DAG, and compute a new fingerprint.
+5. Advance `planRevision` exactly once, record `lastPlanChange`, mark the gap decision `applied`, and recompute affected blocked/ready stages before any new dispatch.
+6. Send `PLAN_REVISED` to the monitor and affected workers with each assignment's disposition. A paused worker remains paused until a refreshed assignment or rework; unaffected workers may continue.
+7. Dispatch the new safe frontier, emit `LOOP_STATE`, and finish.
+
+For a change to goal/scope, a weaker acceptance bar, removed/crossed user gate, external service/cost/credential, irreversible operation, or active-worker authority, move the reporting stage from active to blocked after its gap handoff, mark the gap decision `awaiting_user`, and write `status=awaiting_user`, `expectedNext=null`, and a durable `awaitingUserGate` naming the exact proposal and requested authority. Stop without editing or dispatching affected descendants. Require the user's response to name that proposal/gate; a vague continuation is not approval. After approval, record `USER_DECISION_RECORDED`, clear the gate, set `expectedNext=PLAN_RECONCILE`, and apply it as `classification=user-approved` through the same versioned transaction.
+
+For external services, disclose service identity, maximum spend, credential handling, data handling, and permitted side effects separately. Plan approval does not create missing credentials or authorize anything omitted from that scope.
+
+Example: if G08 cannot produce required evidence because the plan omitted a production-current evidence supplier, adding a prerequisite `G07C`, making G08 depend on it, and retaining G08's original acceptance is an autonomous technical-closure change. Replacing the evidence requirement with a weaker one is not.
+
 ## Successor activation handler
 
 On `FOREMAN_ACTIVATE`:
 
 1. Read state and require leadership `electing`, matching takeover ID, exact registered candidate ID, and event target equal to this task.
 2. Call `adopt-takeover`. If state already shows this task active at the takeover epoch, treat activation as idempotently complete. If another task is active, retire.
-3. Reload state, plan/checklists, repository status, decision ledger, exact worker IDs, and Outbox. Optionally read only a small recent tail of the old foreman when available; never require it.
-4. Reconcile the takeover's saved `resumeExpectedNext`, current stage maps, repository evidence, and undecided reports. Fail closed on conflict.
+3. Reload state, plan/checklists, repository status, decision ledger, exact worker IDs, and Outbox. Verify the current plan fingerprint. Optionally read only a small recent tail of the old foreman when available; never require it.
+4. Reconcile the takeover's saved `resumeExpectedNext`, current plan revision, stage maps, repository evidence, and undecided reports. Fail closed on conflict.
 5. Send `FOREMAN_CHANGED` to the monitor and every exact active/returned/blocked worker ID. Include old/new IDs, new epoch, takeover ID, and `requiredAction=UPDATE_FOREMAN_ROUTE`. Do not wait for every ACK.
 6. Process `failedReportId` first when its Outbox report remains undecided; otherwise resume the oldest verified missing transition.
 7. Write the reconciled execution state, emit a complete `LOOP_STATE`, and finish after review, rework, or dispatch.
@@ -70,7 +89,7 @@ The creator of a successor is not its authority. Authority comes only from the r
 
 ## Watchdog and restart handler
 
-On `WATCHDOG_NUDGE` or `RECOVERY_RECONCILE`, pass the fence check, read durable state, and inspect only evidence needed for the named transition. Resume a delivered undecided report; emit only a missing rework/dispatch action when its decision already exists. Repair disagreement from independently verified task and repository evidence.
+On `WATCHDOG_NUDGE` or `RECOVERY_RECONCILE`, pass the fence check, read durable state, and inspect only evidence needed for the named transition. Resume a delivered undecided report; resume `PLAN_RECONCILE` before dispatch when plan state is incomplete; emit only a missing rework/dispatch action when its decision already exists. Repair disagreement from independently verified task and repository evidence.
 
 Do not retarget monitor automation to this task. Outside initial setup, terminal shutdown, confirmed monitor replacement, or explicit user request, do not modify automation configuration.
 

@@ -46,6 +46,9 @@ try {
     automationId: "automation-1",
     auxiliaryAutomationIds: [],
     planFiles: ["C:/repo/plan.md"],
+    planRevision: 1,
+    planFingerprint: `sha256:${"a".repeat(64)}`,
+    lastPlanChange: null,
     decisionLedger: [],
     reportDecisions: {},
     accepted: [],
@@ -119,6 +122,8 @@ try {
   assert.equal(adopted.leadership.status, "active");
   assert.equal(adopted.foremanThreadId, "foreman-new");
   assert.deepEqual(adopted.leadership.previousForemanThreadIds, ["foreman-old"]);
+  assert.equal(adopted.planRevision, 1);
+  assert.equal(adopted.planFingerprint, initial.planFingerprint);
 
   const proposed = { ...adopted, expectedNext: { actorThreadId: "foreman-new", type: "STAGE_DECISION", stageId: "G01", attempt: 1, since: "2026-08-02T00:03:00.000Z" } };
   run(stateStore, ["write", runId, "5", "foreman-old", "1", JSON.stringify(proposed)], 1);

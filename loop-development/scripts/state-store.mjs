@@ -14,6 +14,9 @@ const runIdPattern = /^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/;
 const runStatuses = new Set(["initializing", "running", "awaiting_user", "completed", "aborted"]);
 const claimantRoles = new Set(["worker", "monitor"]);
 const takeoverReasons = new Set(["two-explicit-delivery-failures", "monitor-confirmed-unreachable"]);
+const planChangeClassifications = new Set(["technical-closure", "user-approved"]);
+const planGapStatuses = new Set(["reported", "pause_requested", "reconciling", "awaiting_user", "applied", "not_a_plan_gap"]);
+const planFingerprintPattern = /^sha256:[a-f0-9]{64}$/;
 
 function fail(message, code = 1) {
   const error = new Error(message);
@@ -64,6 +67,11 @@ function migrateState(value, expectedRunId) {
       ...value,
       project: value.project ?? null,
       workerProfile: value.workerProfile ?? { model: "gpt-5.6-luna", thinking: "max" },
+      planRevision: value.planRevision ?? 1,
+      planFingerprint: value.planFingerprint ?? null,
+      lastPlanChange: value.lastPlanChange ?? null,
+      awaitingUserGate: value.awaitingUserGate ?? null,
+      planGapDecisions: value.planGapDecisions ?? {},
       decisionLedger: value.decisionLedger ?? [],
       reportDecisions: value.reportDecisions ?? {},
       leadership: value.leadership
@@ -85,6 +93,11 @@ function migrateState(value, expectedRunId) {
     runId: value.runId ?? expectedRunId,
     project: value.project ?? null,
     workerProfile: value.workerProfile ?? { model: "gpt-5.6-luna", thinking: "max" },
+    planRevision: value.planRevision ?? 1,
+    planFingerprint: value.planFingerprint ?? null,
+    lastPlanChange: value.lastPlanChange ?? null,
+    awaitingUserGate: value.awaitingUserGate ?? null,
+    planGapDecisions: value.planGapDecisions ?? {},
     decisionLedger: value.decisionLedger ?? [],
     reportDecisions: value.reportDecisions ?? {},
     leadership: {
@@ -167,6 +180,56 @@ function validateState(value, expectedRunId) {
 
   if (!value.workerProfile || value.workerProfile.model !== "gpt-5.6-luna" || value.workerProfile.thinking !== "max") {
     errors.push("workerProfile must fix workers to gpt-5.6-luna with max thinking");
+  }
+
+  if (!Number.isInteger(value.planRevision) || value.planRevision < 1) errors.push("planRevision must be a positive integer");
+  if (value.planFingerprint !== null && (typeof value.planFingerprint !== "string" || !planFingerprintPattern.test(value.planFingerprint))) errors.push("planFingerprint must be a canonical sha256 fingerprint or null");
+  if (value.lastPlanChange !== null) {
+    const change = value.lastPlanChange;
+    if (!change || typeof change !== "object" || Array.isArray(change)) {
+      errors.push("lastPlanChange must be an object or null");
+    } else {
+      if (!nonEmptyString(change.changeId)) errors.push("lastPlanChange.changeId is required");
+      if (!nonEmptyString(change.gapId)) errors.push("lastPlanChange.gapId is required");
+      if (!Number.isInteger(change.fromRevision) || change.fromRevision < 1) errors.push("lastPlanChange.fromRevision must be a positive integer");
+      if (change.toRevision !== value.planRevision) errors.push("lastPlanChange.toRevision must equal planRevision");
+      if (change.toRevision !== change.fromRevision + 1) errors.push("lastPlanChange revisions must advance by exactly one");
+      if (!nonEmptyString(change.reason)) errors.push("lastPlanChange.reason is required");
+      if (!nonEmptyString(change.changedAt)) errors.push("lastPlanChange.changedAt is required");
+      if (!nonEmptyString(change.changedByForemanThreadId)) errors.push("lastPlanChange.changedByForemanThreadId is required");
+      if (!planChangeClassifications.has(change.classification)) errors.push("lastPlanChange.classification is invalid");
+      if (!stringArray(change.affectedStageIds) || change.affectedStageIds.length === 0) errors.push("lastPlanChange.affectedStageIds must be a non-empty string array");
+      if (!stringArray(change.changedFiles) || change.changedFiles.length === 0) errors.push("lastPlanChange.changedFiles must be a non-empty string array");
+      if (change.classification === "technical-closure" && change.approvalEventId != null) errors.push("technical plan changes cannot name an approvalEventId");
+      if (change.classification === "user-approved" && !nonEmptyString(change.approvalEventId)) errors.push("user-approved plan changes require approvalEventId");
+    }
+  }
+  if (value.awaitingUserGate !== null && (typeof value.awaitingUserGate !== "object" || Array.isArray(value.awaitingUserGate))) {
+    errors.push("awaitingUserGate must be an object or null");
+  }
+  if (!value.planGapDecisions || typeof value.planGapDecisions !== "object" || Array.isArray(value.planGapDecisions)) {
+    errors.push("planGapDecisions must be an object");
+  } else {
+    for (const [gapId, decision] of Object.entries(value.planGapDecisions)) {
+      if (!nonEmptyString(gapId)) errors.push("planGapDecisions keys must be non-empty gap IDs");
+      if (!decision || typeof decision !== "object" || Array.isArray(decision)) {
+        errors.push(`planGapDecisions.${gapId} must be an object`);
+        continue;
+      }
+      if (!planGapStatuses.has(decision.status)) errors.push(`planGapDecisions.${gapId}.status is invalid`);
+      if (decision.classification != null && !planChangeClassifications.has(decision.classification)) errors.push(`planGapDecisions.${gapId}.classification is invalid`);
+      if (decision.changeId != null && !nonEmptyString(decision.changeId)) errors.push(`planGapDecisions.${gapId}.changeId must be a string or null`);
+      if (decision.status === "applied" && (!nonEmptyString(decision.changeId) || !Number.isInteger(decision.toPlanRevision) || decision.toPlanRevision < 2)) {
+        errors.push(`planGapDecisions.${gapId} applied entries require changeId and toPlanRevision`);
+      }
+    }
+  }
+  if (value.planRevision > 1 && value.lastPlanChange === null) errors.push("planRevision above 1 requires lastPlanChange");
+  if (value.lastPlanChange !== null) {
+    const appliedGap = value.planGapDecisions?.[value.lastPlanChange.gapId];
+    if (!appliedGap || appliedGap.status !== "applied" || appliedGap.changeId !== value.lastPlanChange.changeId || appliedGap.toPlanRevision !== value.planRevision) {
+      errors.push("lastPlanChange requires a matching applied planGapDecisions entry");
+    }
   }
 
   if (value.status !== "initializing" && !nonEmptyString(value.monitorThreadId)) errors.push("monitorThreadId is required after initialization");
@@ -351,6 +414,25 @@ async function main() {
       requireActiveLeader(current, actorThreadId, actorEpoch);
       if (!sameLeadership(current.leadership, proposedInput.leadership)) fail("generic write cannot modify leadership; use takeover commands");
       if (proposedInput.foremanThreadId !== current.foremanThreadId) fail("generic write cannot modify foremanThreadId");
+      if (proposedInput.planRevision === current.planRevision) {
+        if (JSON.stringify(proposedInput.planFiles) !== JSON.stringify(current.planFiles) || proposedInput.planFingerprint !== current.planFingerprint || JSON.stringify(proposedInput.lastPlanChange) !== JSON.stringify(current.lastPlanChange)) {
+          fail("plan metadata cannot change without advancing planRevision");
+        }
+        const newlyAppliedGap = Object.entries(proposedInput.planGapDecisions).some(([gapId, decision]) => decision?.status === "applied" && current.planGapDecisions?.[gapId]?.status !== "applied");
+        if (newlyAppliedGap) fail("an applied plan gap must advance planRevision in the same write");
+      } else {
+        if (proposedInput.planRevision !== current.planRevision + 1) fail("planRevision must advance by exactly one");
+        if (!nonEmptyString(proposedInput.planFingerprint) || proposedInput.planFingerprint === current.planFingerprint) fail("a plan revision requires a new non-empty planFingerprint");
+        const change = proposedInput.lastPlanChange;
+        if (!change || change.fromRevision !== current.planRevision || change.toRevision !== proposedInput.planRevision) fail("a plan revision requires matching lastPlanChange revisions");
+        if (change.changedByForemanThreadId !== actorThreadId) fail("lastPlanChange must name the active foreman writer");
+        if (Object.values(current.planGapDecisions ?? {}).some((decision) => decision?.status === "applied" && decision.changeId === change.changeId)) fail("a plan revision requires a new changeId");
+        if (current.planGapDecisions?.[change.gapId]?.status === "applied") fail("an applied plan gap cannot advance planRevision again");
+        const gapDecision = proposedInput.planGapDecisions?.[change.gapId];
+        if (!gapDecision || gapDecision.status !== "applied" || gapDecision.changeId !== change.changeId || gapDecision.toPlanRevision !== proposedInput.planRevision) {
+          fail("a plan revision requires a matching applied planGapDecisions entry");
+        }
+      }
       return proposedInput;
     });
     process.stdout.write(`${JSON.stringify(next, null, 2)}\n`);

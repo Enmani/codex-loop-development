@@ -1,6 +1,6 @@
 ---
 name: loop-development
-description: Run an event-driven, multi-task repository development loop with one active foreman, one-stage workers, independent review/rework, automatic next-stage dispatch, durable recovery, automatic fenced foreman replacement after confirmed delivery failure, and a Luna/xhigh watchdog used only as fallback. Use when the user says “开始循环开发”, “继续循环开发”, asks to turn an implementation plan or checklist into an autonomous foreman-worker loop, or when a cross-task LOOP_EVENT explicitly invokes $loop-development with role foreman, worker, or monitor. Treat “开始循环开发” as explicit authorization to create the required monitor, automation, implementation tasks, and bounded replacement-foreman tasks within the active repository plan.
+description: Run an event-driven, multi-task repository development loop with one active foreman, one-stage workers, independent review/rework, constrained adaptive plan revision, automatic next-stage dispatch, durable recovery, automatic fenced foreman replacement after confirmed delivery failure, and a Luna/xhigh watchdog used only as fallback. Use when the user says “开始循环开发”, “继续循环开发”, asks to turn an implementation plan or checklist into an autonomous foreman-worker loop, or when a cross-task LOOP_EVENT explicitly invokes $loop-development with role foreman, worker, or monitor. Treat “开始循环开发” as explicit authorization to create the required monitor, automation, implementation tasks, bounded replacement-foreman tasks, and technical-closure plan amendments that preserve the user's approved goal and acceptance bar.
 ---
 
 # Loop Development
@@ -28,7 +28,8 @@ When the user says “开始循环开发” in a repository task, treat it as a 
 5. Attach a 20-minute heartbeat automation to that monitoring task.
 6. Create the first safe ready set of one to N implementation tasks, explicitly using `gpt-5.6-luna` with `max` reasoning for every worker.
 7. Permit a worker or monitor to create one fresh replacement foreman only after it wins the bounded atomic takeover procedure.
-8. End the foreman turn immediately after dispatch and the final state snapshot.
+8. Permit the active foreman to repair technical gaps in the plan while preserving the approved goal, scope boundary, user gates, and acceptance bar.
+9. End the foreman turn immediately after dispatch and the final state snapshot.
 
 This authorization does not permit unrelated repository work, destructive actions, automatic commits, worktrees, branches, speculative replacements, or crossing an explicit user gate.
 
@@ -42,6 +43,10 @@ If task creation, cross-task messaging, or automation management is unavailable,
 
 - Exactly one foreman epoch is active. Every actor reads `leadership` before routing a control message.
 - Only the active foreman may write execution progress. Workers and monitors may only append immutable reports or invoke the bounded takeover commands.
+- Only the active foreman may amend plan/checklist contracts. Workers report `PLAN_GAP_FOUND`; they never silently expand scope or edit the governing plan.
+- Autonomous plan changes are limited to technical closure: missing prerequisites, dependency corrections, stage splits, and stronger verification needed to reach the existing goal. Goal/scope changes, weaker acceptance, removed user gates, external authority/cost/credentials, irreversible operations, or changed active-worker authorization require explicit user approval first.
+- Every applied plan change advances `planRevision` by exactly one, changes `planFingerprint`, records `lastPlanChange`, reconciles the DAG, and broadcasts `PLAN_REVISED` to affected participants.
+- An affected active worker must complete the durable `PLAN_PAUSE`/`PLAN_PAUSE_ACK` handshake before plan files are edited; the old assignment remains fenced until a refreshed assignment or rework.
 - A worker implements one stage and never self-accepts or creates downstream implementation work. Creating a claimed successor foreman is the only narrow exception.
 - Every implementation worker uses `gpt-5.6-luna` with `max` reasoning. Persist this worker profile so successor foremen cannot drift to a default model.
 - Rework returns to the same worker unless the active foreman records that task as unrecoverable and superseded.
@@ -62,5 +67,6 @@ If task creation, cross-task messaging, or automation management is unavailable,
 - `scripts/state-store.mjs`: validate state, fence stale foremen, and perform revision-checked takeover transitions.
 - `scripts/report-outbox.mjs`: append and read immutable worker reports.
 - `scripts/validate-manifest.mjs`: validate normalized stage IDs, dependencies, locks, and acceptance fields.
+- `scripts/plan-fingerprint.mjs`: compute the canonical fingerprint for the ordered governing plan files.
 
-The tools protect state transitions; repository plans, independently verified evidence, and the active foreman's decisions remain the specification truth.
+The tools protect state transitions; the versioned repository plan, independently verified evidence, and the active foreman's recorded decisions remain the specification truth.

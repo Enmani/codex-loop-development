@@ -6,16 +6,17 @@
 2. Durable state and leadership
 3. Immutable report Outbox
 4. Event envelope and stage state machine
-5. Foreman failover transaction
-6. Foreman snapshot and terminal shutdown
-7. Idempotency and ready-frontier rules
+5. Adaptive plan amendment transaction
+6. Foreman failover transaction
+7. Foreman snapshot and terminal shutdown
+8. Idempotency and ready-frontier rules
 
 ## Truth ownership and plan contract
 
 Keep one owner for each kind of truth:
 
 - Repository plan and checklists: required scope, dependencies, acceptance, and user gates.
-- Durable run state: execution state, active leadership epoch, participants, automation IDs, decisions, and expected transition.
+- Durable run state: execution state, active leadership epoch, participants, automation IDs, plan revision/fingerprint, decisions, and expected transition.
 - Immutable report Outbox: worker delivery payloads that must survive message failure.
 - Foreman's latest full `LOOP_STATE`: compact human-visible mirror of durable state.
 - Worker messages and coordination cards: wake signals and evidence pointers, never acceptance truth.
@@ -61,6 +62,11 @@ Use schema version 2. The minimum leadership shape is:
   "automationId": "automation-monitor",
   "auxiliaryAutomationIds": [],
   "planFiles": ["C:/repo/docs/plan.md"],
+  "planRevision": 1,
+  "planFingerprint": "sha256:...",
+  "lastPlanChange": null,
+  "awaitingUserGate": null,
+  "planGapDecisions": {},
   "decisionLedger": [],
   "reportDecisions": {},
   "accepted": [],
@@ -139,6 +145,7 @@ Primary events:
 
 - `MONITOR_CONFIG`, `STAGE_ASSIGN`, `STAGE_REPORT_READY`, `STAGE_BLOCKED`.
 - `REVIEW_STARTED`, `STAGE_DECISION`, `STAGE_REWORK`, `DELIVERY_RETRY`.
+- `PLAN_GAP_FOUND`, `PLAN_PAUSE`, `PLAN_PAUSE_ACK`, `PLAN_REVISED`, `USER_DECISION_REQUIRED`, `USER_DECISION_RECORDED`.
 - `WATCHDOG_NUDGE`, `RECOVERY_RECONCILE`, `RUN_COMPLETE`, `RUN_ABORTED`.
 - `FOREMAN_REPAIR_STARTED`, `FOREMAN_REPAIR_FINISHED`, `FOREMAN_ACTIVATE`, `FOREMAN_CHANGED`, `FOREMAN_SWITCH_ACK`, `FAILOVER_HELP_REQUEST`.
 
@@ -148,13 +155,54 @@ Allow only these stage transitions:
 
 ```text
 pending -> assigned -> report_ready -> reviewing -> accepted
-                       |              |
-                       |              -> returned -> report_ready
-                       -> blocked
+             |         |              |
+             |         |              -> returned -> report_ready
+             |         -> blocked
+             -> plan_paused
+             -> plan_pause_requested -> plan_paused -> assigned
+                                      |               -> returned -> report_ready
+                                      -> report_ready
 reviewing -> blocked
 ```
 
-`partial` does not satisfy a dependency. Mark an unrecoverable worker `superseded` before replacing it.
+The direct `assigned -> plan_paused` edge is allowed only for the reporting worker whose delivered `PLAN_GAP_FOUND` has `safeBoundaryReached=true`; every other active worker must use the ACK path. Store `plan_pause_requested` in the active stage entry so its capacity and locks remain reserved. After `PLAN_PAUSE_ACK`, move it to the blocked map with `status=plan_paused`, preserving exact worker ID, attempt, previous plan revision, gap ID, and resume mode. Re-activate the same worker with a refreshed assignment and unchanged attempt when its existing work remains valid; use `STAGE_REWORK` with an incremented attempt when the new contract invalidates submitted work. Mark an unrecoverable worker `superseded` before replacing it. `partial` and `plan_paused` do not satisfy dependencies.
+
+## Adaptive plan amendment transaction
+
+Workers may discover that the approved plan is incomplete or technically wrong while implementing it. They must preserve a `kind=plan-gap` report with stable `gapId` and `reportId` in Outbox and send `PLAN_GAP_FOUND` to the active foreman; they do not edit the governing plan, broaden their assignment, or decide the remedy. The report includes `safeBoundaryReached=true`, and successful delivery is the worker's last tool action, so that event also acknowledges the reporting worker's pause. Other affected active workers still require `PLAN_PAUSE`/`PLAN_PAUSE_ACK`.
+
+The active foreman owns `planGapDecisions[gapId]`. Its status is one of `reported`, `pause_requested`, `reconciling`, `awaiting_user`, `applied`, or `not_a_plan_gap`, and it records the report ID, classification, change ID, and resulting plan revision when known. A duplicate gap event resumes this recorded transition; `applied` returns the existing result and can never increment `planRevision` again.
+
+The active foreman first distinguishes a genuine plan defect from temporary unavailability, ordinary implementation difficulty, or a currently blocked external dependency. Only a genuine defect enters plan amendment; the others remain normal `STAGE_BLOCKED` handling. Then classify the proposed plan change:
+
+- `technical-closure`: may be applied autonomously when it only adds a missing prerequisite, corrects dependencies, splits an existing stage, or strengthens verification needed to reach the already approved goal.
+- `user-approved`: required before changing the product goal or scope boundary, weakening acceptance, removing or crossing a user gate, adding external services/cost/credentials, authorizing irreversible operations, or changing an active worker's write/safety authority.
+
+For `user-approved`, keep the affected stage blocked, write `status=awaiting_user`, `expectedNext=null`, and a durable `awaitingUserGate` containing a stable `gateId`, `proposalId`, gap/report IDs, requested changes, preserved acceptance, and exact authority requested. Emit `USER_DECISION_REQUIRED` and stop. Do not edit the plan or dispatch affected descendants until the user explicitly approves that exact proposal.
+
+A vague `continue`, worker/monitor agreement, or approval of a different gate is not approval. When external services are involved, the proposal must separately disclose service identity, spending bound, credential provisioning/storage, data handling, and permitted side effects; omitted authority remains forbidden, and approval to revise the plan does not imply that credentials are available. Record an explicit, scoped user response as `USER_DECISION_RECORDED` with a stable event ID. Only then clear `awaitingUserGate`, return to `running`, set `expectedNext=PLAN_RECONCILE`, and apply the change. A user-approved applied change names that event in `lastPlanChange.approvalEventId`.
+
+Apply an authorized change as one recoverable transaction:
+
+1. Pass the foreman fence check, load the immutable gap report, and create or resume `planGapDecisions[gapId]` through a completed fenced state write. When the reporting worker is still active and its delivered report has `safeBoundaryReached=true`, that same write moves it directly from active to blocked `plan_paused`; do not send it a redundant `PLAN_PAUSE`.
+2. For each other affected active worker, process one at a time: set the gap decision to `pause_requested`, persist that exact stage as `plan_pause_requested`, keep its capacity/locks reserved, set `expectedNext=PLAN_PAUSE_ACK` for that worker, send one `PLAN_PAUSE`, and end the foreman turn. The worker stops at a safe boundary, re-reads state, sends `PLAN_PAUSE_ACK`, and finishes. On ACK, move it to blocked `plan_paused` and release its active locks/capacity; then pause the next affected worker in a later event turn. Never edit the plan concurrently with an unacknowledged affected worker; if that task is independently confirmed unrecoverable, use the existing supersede rules.
+3. After the reporting worker and every other affected worker are durably `plan_paused`, complete a separate fenced write setting the gap decision to `reconciling` and `expectedNext.type=PLAN_RECONCILE`. This durable write must finish before editing plan files. Pause only dispatches that could cross the affected dependency boundary.
+4. Re-read all `planFiles`; ensure no active worker owns their write set. Preserve accepted-stage history and existing stable stage IDs. Add new stable IDs instead of renumbering old stages.
+5. Edit the governing plan/checklists, then validate stage IDs, dependencies, write sets, locks, acceptance, and user gates. A plan edit that lowers prior acceptance or invalidates accepted evidence is not autonomous.
+6. Compute the canonical fingerprint over the ordered current `planFiles`:
+
+```text
+node <skill-dir>/scripts/plan-fingerprint.mjs '<plan-files-json-array>'
+```
+
+Use this helper at startup, after amendment, and during successor reconciliation so path normalization, byte framing, and ordering stay identical.
+7. Advance `planRevision` by exactly one and write a new fingerprint plus `lastPlanChange`: gap ID, change ID, from/to revisions, reason, active foreman ID, classification, affected stage IDs, changed files, timestamp, and approval event when required.
+8. Record the reasoning in `decisionLedger`, mark the same stable gap decision `applied` with matching change ID and target plan revision, recompute `ready` and `blocked`, and persist through the fenced generic write. The state tool rejects a repeated applied gap. Do not dispatch from a plan revision that has not been persisted.
+9. Send `PLAN_REVISED` to the monitor and every affected active/returned/blocked worker. Include old/new revision, fingerprint, affected stages, each assignment disposition (`unaffected`, `remain_paused`, `refresh_assignment`, or `rework`), and `requiredAction=RELOAD_PLAN_AND_RECONCILE_ASSIGNMENT`.
+10. Unaffected workers may continue. An affected worker remains paused until a refreshed `STAGE_ASSIGN` or `STAGE_REWORK` from the active foreman; `PLAN_REVISED` alone never reactivates it.
+11. Dispatch the newly valid ready frontier under the new revision, emit `LOOP_STATE`, and finish.
+
+If editing, validation, fingerprinting, or state persistence fails, leave `expectedNext=PLAN_RECONCILE`, do not partially dispatch the new DAG, and repair or revert only the incomplete plan edit using repository-safe recovery. A successor foreman must compare durable `planFingerprint` with current `planFiles` before review or dispatch; mismatch is a fail-closed reconciliation condition, not permission to guess.
 
 ## Foreman failover transaction
 
@@ -241,7 +289,7 @@ Every foreman activation begins with a fence check. A task whose ID/epoch is not
 End every active-foreman turn with one compact complete snapshot:
 
 ```text
-LOOP_STATE {"v":3,"runId":"...","revision":8,"status":"running","leadership":{"epoch":2,"status":"active","activeForemanThreadId":"..."},"monitorThreadId":"...","automationId":"...","accepted":["G01"],"active":{},"returned":{},"blocked":{},"ready":["G02"],"awaitingUserGate":null,"lastEventId":"...","expectedNext":{"actorThreadId":"...","type":"STAGE_ASSIGN","since":"..."},"automationShutdown":null}
+LOOP_STATE {"v":3,"runId":"...","revision":8,"status":"running","leadership":{"epoch":2,"status":"active","activeForemanThreadId":"..."},"planRevision":2,"planFingerprint":"sha256:...","monitorThreadId":"...","automationId":"...","accepted":["G01"],"active":{},"returned":{},"blocked":{},"ready":["G02"],"awaitingUserGate":null,"lastEventId":"...","expectedNext":{"actorThreadId":"...","type":"STAGE_ASSIGN","since":"..."},"automationShutdown":null}
 ```
 
 Completion is valid only when every manifest stage is accepted, active/returned/blocked/ready/pending are empty, every user gate is approved, and final evidence is recorded. Then exactly once:
@@ -257,6 +305,7 @@ Completion is valid only when every manifest stage is accepted, active/returned/
 - A duplicate report without a decision resumes review; a decided report returns the recorded decision.
 - Ignore late messages from superseded workers and all control messages from fenced foremen.
 - Re-read repository files before review; worker summaries and old task history are evidence only.
+- Re-read the durable plan revision before every assignment and handoff. A stale `PLAN_GAP_FOUND` remains evidence but cannot roll back a newer plan.
 - Treat `idle` and `notLoaded` as runtime states, not completion or failure proof.
 - Dispatch ready stages only when every dependency is accepted, capacity remains, write sets and locks are compatible, active coordination has no conflicting owner, and no user gate blocks progress.
 - When uncertain, serialize rather than create speculative parallel work.

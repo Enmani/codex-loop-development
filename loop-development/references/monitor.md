@@ -12,9 +12,9 @@ Keep the monitor projectless. Its heartbeat automation always targets this monit
 
 On each scheduled run:
 
-1. Read durable state first, including leadership, takeover, project facts, exact participants, expected transition, and Outbox reports.
+1. Read durable state first, including leadership, takeover, plan revision/fingerprint, project facts, exact participants, expected transition, and Outbox reports.
 2. If the run is `completed` or `aborted`, set recorded automations `INACTIVE`, verify, and return `MONITOR_STOPPED`.
-3. If `awaiting_user`, return `NO_OP` unless terminal automation cleanup is incomplete.
+3. If `awaiting_user`, return `NO_OP` unless terminal automation cleanup is incomplete. Never turn an `awaitingUserGate` into `PLAN_RECONCILE` or solicit approval on the user's behalf.
 4. If leadership is `electing`, execute only the takeover recovery procedure below.
 5. If the active foreman or any current worker is making ordinary progress, return `NO_OP`.
 6. Otherwise identify one oldest missing transition and apply at most one nudge.
@@ -38,11 +38,16 @@ Default thresholds:
 | Review started, no decision | Nudge active foreman to resume and decide |
 | Returned stage, same worker idle | Nudge worker to resume recorded attempt |
 | Accepted stage, ready frontier exists | Nudge active foreman to reconcile and continue |
+| `PLAN_GAP_FOUND` exists or `PLAN_RECONCILE` is stale | Nudge active foreman to classify or finish the recorded plan transaction |
+| `plan_pause_requested` has no `PLAN_PAUSE_ACK` | Nudge the exact affected worker to stop at a safe boundary and ACK |
+| `PLAN_REVISED` persisted but an affected assignment was not refreshed | Nudge active foreman to reconcile that assignment |
 | State/task evidence ambiguous | Send `RECOVERY_RECONCILE` to active foreman |
 | First explicit nudge delivery fails | Claim repair lease, archive/unarchive active foreman, then retry once |
 | Post-repair nudge to the same leader/epoch also fails | Claim foreman takeover |
 
 Each nudge invokes `$loop-development`, names the exact target and epoch, and asks only for the missing role action. Do not copy the full report or insert an acceptance/dispatch decision. Record error evidence, issue key, reminder number, and timestamp. Send at most one ordinary cross-task nudge per heartbeat.
+
+The monitor never decides whether a proposed plan change is valid and never edits plan files. It only observes whether the active foreman completed the durable `PLAN_RECONCILE` transition. After `PLAN_REVISED`, verify that state carries the announced revision/fingerprint; treat a mismatch as `RECOVERY_RECONCILE`, not as permission to repair the repository.
 
 ## Takeover recovery
 

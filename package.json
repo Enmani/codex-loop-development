@@ -1,10 +1,10 @@
 {
   "name": "codex-loop-development",
-  "version": "1.1.0",
+  "version": "1.2.0",
   "private": true,
   "type": "module",
   "scripts": {
-    "check": "node --check loop-development/scripts/state-store.mjs && node --check loop-development/scripts/report-outbox.mjs && node --check loop-development/scripts/validate-manifest.mjs",
-    "test": "node tests/failover-smoke.mjs && node tests/failover-concurrency.mjs"
+    "check": "node --check loop-development/scripts/state-store.mjs && node --check loop-development/scripts/report-outbox.mjs && node --check loop-development/scripts/validate-manifest.mjs && node --check loop-development/scripts/plan-fingerprint.mjs",
+    "test": "node tests/failover-smoke.mjs && node tests/failover-concurrency.mjs && node tests/plan-amendment-smoke.mjs"
   }
 }
